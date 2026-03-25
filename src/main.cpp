@@ -29,6 +29,9 @@
 #define I2C_SCL                 22      // ESP32 I2C SCL pin
 #define OLED_UPDATE_INTERVAL_MS 100     // OLED refresh interval (100ms = 10 Hz)
 #define SENSOR_INTERVAL_MS      10      // Sensor read interval (10ms = 100 Hz)
+#define BUTTON_PIN              15      // GPIO15 — zero calibration button (active LOW)
+#define DEBOUNCE_MS             50      // Button debounce time (ms)
+#define ZERO_MSG_DURATION_MS    1000    // "ZERO SET!" OLED message display time (ms)
 
 // ============================================================
 // OLED Configuration
@@ -66,6 +69,26 @@ unsigned long prevDisplayTime = 0;  // Last OLED update timestamp (ms)
 float roll  = 0.0f;
 float pitch = 0.0f;
 float yaw   = 0.0f;
+
+// ============================================================
+// Zero Calibration Offsets
+// ============================================================
+float rollOffset  = 0.0f;
+float pitchOffset = 0.0f;
+float yawOffset   = 0.0f;
+
+// ============================================================
+// Button Debounce State
+// ============================================================
+int   lastButtonState      = HIGH;  // Previous raw reading (seeded in setup)
+int   acceptedButtonState   = HIGH;  // Debounced stable state (seeded in setup)
+unsigned long lastDebounceTime = 0;  // Timestamp of last state change
+
+// ============================================================
+// OLED Zero-Set Feedback Timing
+// ============================================================
+bool  showZeroMsg          = false;  // Whether to show "ZERO SET!" on OLED
+unsigned long zeroMsgStartTime = 0;  // When the message was triggered
 
 // ============================================================
 // Helper: Format angle string with explicit sign and 2 decimals
@@ -170,6 +193,13 @@ void setup() {
   display.display();
   delay(1000);  // Only delay in setup — splash screen
 
+  // --- Zero Calibration Button ---
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  delay(10);  // Let pull-up settle before first read
+  lastButtonState    = digitalRead(BUTTON_PIN);  // Seed with actual pin state
+  acceptedButtonState = lastButtonState;          // No spurious trigger on first loop
+  Serial.println("[BUTTON] GPIO" + String(BUTTON_PIN) + " configured (INPUT_PULLUP, initial=" + String(lastButtonState) + ")");
+
   // --- Madgwick Filter ---
   // Begin with the target sensor sample rate (100 Hz)
   madgwickFilter.begin(100);
@@ -263,12 +293,16 @@ void loop() {
     yaw = heading;
 
     // ---------------------------------------------------------
-    // 6. Serial output for debugging
+    // 6. Serial output for debugging (offset-corrected values)
     // ---------------------------------------------------------
+    float displayRoll  = roll  - rollOffset;
+    float displayPitch = pitch - pitchOffset;
+    float displayYaw   = yaw   - yawOffset;
+
     char rollStr[12], pitchStr[12], yawStr[12];
-    formatAngle(rollStr, roll);
-    formatAngle(pitchStr, pitch);
-    formatAngle(yawStr, yaw);
+    formatAngle(rollStr, displayRoll);
+    formatAngle(pitchStr, displayPitch);
+    formatAngle(yawStr, displayYaw);
 
     Serial.print("Roll: ");
     Serial.print(rollStr);
@@ -280,6 +314,51 @@ void loop() {
   }
 
   // ===========================================================
+  // BUTTON DEBOUNCE + ZERO CALIBRATION — non-blocking
+  // ===========================================================
+  int currentReading = digitalRead(BUTTON_PIN);
+
+  if (currentReading != lastButtonState) {
+    lastDebounceTime = now;  // Reset debounce timer on any state change
+  }
+
+  if ((now - lastDebounceTime) >= DEBOUNCE_MS) {
+    // Reading has been stable for DEBOUNCE_MS — accept it
+    if (currentReading != acceptedButtonState) {
+      acceptedButtonState = currentReading;
+
+      // Trigger on press (HIGH → LOW transition)
+      if (acceptedButtonState == LOW) {
+        // Capture current raw angles as new zero reference
+        rollOffset  = roll;
+        pitchOffset = pitch;
+        yawOffset   = yaw;
+
+        // Serial feedback
+        char rBuf[12], pBuf[12], yBuf[12];
+        formatAngle(rBuf, roll  - rollOffset);
+        formatAngle(pBuf, pitch - pitchOffset);
+        formatAngle(yBuf, yaw   - yawOffset);
+        Serial.print("[CALIBRATION] Zero reference set — Roll: ");
+        Serial.print(rBuf); Serial.print("° | Pitch: ");
+        Serial.print(pBuf); Serial.print("° | Yaw: ");
+        Serial.print(yBuf); Serial.println("°");
+
+        // Trigger OLED feedback
+        showZeroMsg = true;
+        zeroMsgStartTime = now;
+      }
+    }
+  }
+
+  lastButtonState = currentReading;
+
+  // Auto-clear "ZERO SET!" message after duration expires
+  if (showZeroMsg && (now - zeroMsgStartTime >= ZERO_MSG_DURATION_MS)) {
+    showZeroMsg = false;
+  }
+
+  // ===========================================================
   // OLED DISPLAY UPDATE — runs at ~10 Hz (every 100ms)
   // Independent of sensor loop
   // ===========================================================
@@ -288,46 +367,67 @@ void loop() {
 
     display.clearDisplay();
 
-    // --- Header ---
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(22, 0);
-    display.println("ORIENTATION");
+    if (showZeroMsg) {
+      // --- "ZERO SET!" Feedback Screen ---
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(10, 8);
+      display.println("==================");
+      display.setCursor(16, 20);
+      display.println("ZERO SET!");
+      display.setCursor(16, 32);
+      display.println("New reference");
+      display.setCursor(16, 44);
+      display.println("saved");
+      display.setCursor(10, 54);
+      display.println("==================");
+    } else {
+      // --- Normal Orientation Display ---
+      float displayRoll  = roll  - rollOffset;
+      float displayPitch = pitch - pitchOffset;
+      float displayYaw   = yaw   - yawOffset;
 
-    // Separator line
-    display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+      // --- Header ---
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(22, 0);
+      display.println("ORIENTATION");
 
-    // --- Angle Values ---
-    char angleBuf[12];
+      // Separator line
+      display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
 
-    // Roll
-    display.setTextSize(1);
-    display.setCursor(0, 16);
-    display.print("Roll  : ");
-    formatAngle(angleBuf, roll);
-    display.setTextSize(1);
-    display.setCursor(50, 16);
-    display.print(angleBuf);
-    display.print((char)247);  // ° symbol
+      // --- Angle Values ---
+      char angleBuf[12];
 
-    // Pitch
-    display.setCursor(0, 30);
-    display.print("Pitch : ");
-    formatAngle(angleBuf, pitch);
-    display.setCursor(50, 30);
-    display.print(angleBuf);
-    display.print((char)247);
+      // Roll
+      display.setTextSize(1);
+      display.setCursor(0, 16);
+      display.print("Roll  : ");
+      formatAngle(angleBuf, displayRoll);
+      display.setTextSize(1);
+      display.setCursor(50, 16);
+      display.print(angleBuf);
+      display.print((char)247);  // degree symbol
 
-    // Yaw
-    display.setCursor(0, 44);
-    display.print("Yaw   : ");
-    formatAngle(angleBuf, yaw);
-    display.setCursor(50, 44);
-    display.print(angleBuf);
-    display.print((char)247);
+      // Pitch
+      display.setCursor(0, 30);
+      display.print("Pitch : ");
+      formatAngle(angleBuf, displayPitch);
+      display.setCursor(50, 30);
+      display.print(angleBuf);
+      display.print((char)247);
 
-    // Bottom separator
-    display.drawLine(0, 56, 127, 56, SSD1306_WHITE);
+      // Yaw
+      display.setCursor(0, 44);
+      display.print("Yaw   : ");
+      formatAngle(angleBuf, displayYaw);
+      display.setCursor(50, 44);
+      display.print(angleBuf);
+      display.print((char)247);
+
+      // Bottom separator
+      display.drawLine(0, 56, 127, 56, SSD1306_WHITE);
+    }
 
     // Push to display
     display.display();
