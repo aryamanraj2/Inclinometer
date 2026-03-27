@@ -45,6 +45,16 @@
 #define MAX_TILT_ANGLE          45.0f   // Angle (°) at which bubble reaches outer ring edge
 
 // ============================================================
+// Buzzer Configuration
+// ============================================================
+#define BUZZER_PIN              18      // GPIO18 — passive buzzer output
+#define BUZZER_CHANNEL          0       // LEDC PWM channel for buzzer
+#define BUZZER_FREQ             2000    // Hz — audible beep frequency
+#define BUZZER_RESOLUTION       8       // PWM resolution in bits (0–255)
+#define TILT_THRESHOLD          30.0f   // Degrees — alert if |roll| or |pitch| exceeds this
+#define BUZZER_DUTY             128     // 50% duty cycle (out of 255 for 8-bit)
+
+// ============================================================
 // OLED Configuration
 // ============================================================
 #define SCREEN_WIDTH  128
@@ -118,6 +128,25 @@ bool  ei_buffer_full        = false;   // Whether buffer has filled (ready for i
 unsigned long prevEISampleTime = 0;    // Last EI sample timestamp (ms)
 String gestureLabel         = "idle";  // Detected gesture label
 float  gestureConfidence    = 0.0f;    // Confidence of detected gesture
+
+// ============================================================
+// Buzzer Beep State Machine
+// ============================================================
+enum BeepState {
+  BEEP_IDLE,          // Buzzer silent, waiting for trigger
+  BEEP1_ON,           // First beep ON  (100ms)
+  BEEP1_OFF,          // Gap between beeps (50ms)
+  BEEP2_ON,           // Second beep ON (100ms)
+  BEEP_DONE,          // Double-beep finished, return to idle
+  SAFE_BEEP_ON,       // Single short beep — angle returned safe (50ms)
+  SAFE_BEEP_DONE      // Safe beep finished, return to idle
+};
+
+BeepState beepState          = BEEP_IDLE;  // Current beep state
+unsigned long beepTimer      = 0;          // millis timestamp for state transitions
+bool tiltTriggered           = false;      // Hysteresis flag: true = threshold was exceeded
+bool oledFlashActive         = false;      // Triggers single-frame OLED invert
+unsigned long oledFlashTimer = 0;          // millis timestamp for flash duration
 
 // ============================================================
 // Edge Impulse: required ei_printf implementation
@@ -423,6 +452,12 @@ void setup() {
   prevDisplayTime = millis();
   prevEISampleTime = millis();
 
+  // --- Buzzer (LEDC PWM) ---
+  ledcSetup(BUZZER_CHANNEL, BUZZER_FREQ, BUZZER_RESOLUTION);
+  ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
+  ledcWrite(BUZZER_CHANNEL, 0);  // Start silent
+  Serial.println("[BUZZER] GPIO" + String(BUZZER_PIN) + " configured (LEDC ch" + String(BUZZER_CHANNEL) + ", " + String(BUZZER_FREQ) + "Hz)");
+
   Serial.println();
   Serial.println("[EI] Model: " + String(EI_CLASSIFIER_PROJECT_NAME));
   Serial.println("[EI] Labels: " + String(EI_CLASSIFIER_LABEL_COUNT) + ", Window: " + String(EI_CLASSIFIER_RAW_SAMPLE_COUNT) + " samples @ " + String(EI_CLASSIFIER_FREQUENCY) + "Hz");
@@ -602,6 +637,11 @@ void loop() {
         pitchOffset = pitch;
         yawOffset   = yaw;
 
+        // Reset tilt alert state so buzzer doesn't retrigger after recal
+        tiltTriggered = false;
+        beepState = BEEP_IDLE;
+        ledcWrite(BUZZER_CHANNEL, 0);
+
         // Serial feedback
         char rBuf[12], pBuf[12], yBuf[12];
         formatAngle(rBuf, roll  - rollOffset);
@@ -646,6 +686,84 @@ void loop() {
   // Auto-clear "ZERO SET!" message after duration expires
   if (showZeroMsg && (now - zeroMsgStartTime >= ZERO_MSG_DURATION_MS)) {
     showZeroMsg = false;
+  }
+
+  // ===========================================================
+  // TILT ALERT — threshold check + buzzer state machine
+  // Runs every loop iteration, fully non-blocking
+  // ===========================================================
+  {
+    float displayRollAlert  = roll  - rollOffset;
+    float displayPitchAlert = pitch - pitchOffset;
+    bool overThreshold = (fabs(displayRollAlert) > TILT_THRESHOLD) ||
+                         (fabs(displayPitchAlert) > TILT_THRESHOLD);
+
+    // --- Threshold crossing detection with hysteresis ---
+    if (overThreshold && !tiltTriggered && beepState == BEEP_IDLE) {
+      tiltTriggered = true;
+      beepState = BEEP1_ON;
+      beepTimer = now;
+      ledcWrite(BUZZER_CHANNEL, BUZZER_DUTY);  // Start first beep
+      oledFlashActive = true;
+      oledFlashTimer = now;
+      Serial.println("[TILT] Threshold exceeded! Alert triggered.");
+    } else if (!overThreshold && tiltTriggered && beepState == BEEP_IDLE) {
+      tiltTriggered = false;
+      beepState = SAFE_BEEP_ON;
+      beepTimer = now;
+      ledcWrite(BUZZER_CHANNEL, BUZZER_DUTY);  // Start safe beep
+      Serial.println("[TILT] Returned to safe range.");
+    }
+
+    // --- Beep state machine (millis-based, no delay) ---
+    switch (beepState) {
+      case BEEP1_ON:
+        if (now - beepTimer >= 100) {
+          ledcWrite(BUZZER_CHANNEL, 0);        // Silence gap
+          beepState = BEEP1_OFF;
+          beepTimer = now;
+        }
+        break;
+      case BEEP1_OFF:
+        if (now - beepTimer >= 50) {
+          ledcWrite(BUZZER_CHANNEL, BUZZER_DUTY); // Second beep
+          beepState = BEEP2_ON;
+          beepTimer = now;
+        }
+        break;
+      case BEEP2_ON:
+        if (now - beepTimer >= 100) {
+          ledcWrite(BUZZER_CHANNEL, 0);        // Done
+          beepState = BEEP_DONE;
+        }
+        break;
+      case BEEP_DONE:
+        beepState = BEEP_IDLE;
+        break;
+      case SAFE_BEEP_ON:
+        if (now - beepTimer >= 50) {
+          ledcWrite(BUZZER_CHANNEL, 0);        // Done
+          beepState = SAFE_BEEP_DONE;
+        }
+        break;
+      case SAFE_BEEP_DONE:
+        beepState = BEEP_IDLE;
+        break;
+      case BEEP_IDLE:
+      default:
+        break;
+    }
+  }
+
+  // ===========================================================
+  // OLED FLASH — invert display for one frame on tilt alert
+  // ===========================================================
+  if (oledFlashActive) {
+    display.invertDisplay(true);
+    if (now - oledFlashTimer >= 100) {
+      display.invertDisplay(false);
+      oledFlashActive = false;
+    }
   }
 
   // ===========================================================
