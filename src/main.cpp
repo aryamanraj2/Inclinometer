@@ -16,6 +16,7 @@
 #include <MadgwickAHRS.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Inclinometer_inferencing.h>
 
 // ============================================================
 // TUNABLE PARAMETERS — adjust these as needed
@@ -32,6 +33,8 @@
 #define BUTTON_PIN              15      // GPIO15 — zero calibration button (active LOW)
 #define DEBOUNCE_MS             50      // Button debounce time (ms)
 #define ZERO_MSG_DURATION_MS    1000    // "ZERO SET!" OLED message display time (ms)
+#define CONFIDENCE_THRESHOLD    0.7f    // Minimum confidence to accept a gesture
+#define EI_SAMPLE_INTERVAL_MS   16      // ~60 Hz sampling for Edge Impulse (matches model training)
 
 // ============================================================
 // OLED Configuration
@@ -91,6 +94,36 @@ bool  showZeroMsg          = false;  // Whether to show "ZERO SET!" on OLED
 unsigned long zeroMsgStartTime = 0;  // When the message was triggered
 
 // ============================================================
+// Edge Impulse Gesture Inference State
+// ============================================================
+float ei_buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE]; // Buffer: 120 samples × 6 axes = 720 floats
+int   ei_buffer_ix          = 0;       // Current write index into ei_buffer
+bool  ei_buffer_full        = false;   // Whether buffer has filled (ready for inference)
+unsigned long prevEISampleTime = 0;    // Last EI sample timestamp (ms)
+String gestureLabel         = "idle";  // Detected gesture label
+float  gestureConfidence    = 0.0f;    // Confidence of detected gesture
+
+// ============================================================
+// Edge Impulse: required ei_printf implementation
+// ============================================================
+void ei_printf(const char *format, ...) {
+  static char print_buf[256] = { 0 };
+  va_list args;
+  va_start(args, format);
+  int r = vsnprintf(print_buf, sizeof(print_buf), format, args);
+  va_end(args);
+  if (r > 0) Serial.write(print_buf);
+}
+
+// ============================================================
+// Edge Impulse: callback to feed buffer data into the classifier
+// ============================================================
+int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
+  memcpy(out_ptr, ei_buffer + offset, length * sizeof(float));
+  return 0;
+}
+
+// ============================================================
 // Helper: Format angle string with explicit sign and 2 decimals
 // Writes into the provided buffer (must be at least 10 chars)
 // ============================================================
@@ -115,6 +148,8 @@ void setup() {
 
   // --- I2C Bus ---
   Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);  // 400 kHz Fast Mode — required for reliable SSD1306 comms
+  delay(50);              // Let I2C bus settle before device init
   Serial.println("[I2C] Bus initialized (SDA=" + String(I2C_SDA) + ", SCL=" + String(I2C_SCL) + ")");
 
   // --- I2C Scanner (debug) ---
@@ -138,6 +173,7 @@ void setup() {
 
   // Re-init I2C after scanner to clear bus state
   Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);  // Re-apply 400 kHz after bus re-init
   delay(100);
 
   // --- MPU6050 Initialization ---
@@ -205,9 +241,13 @@ void setup() {
   madgwickFilter.begin(100);
 
   // Record starting times
-  prevSensorTime = millis();
+  prevSensorTime  = millis();
   prevDisplayTime = millis();
+  prevEISampleTime = millis();
 
+  Serial.println();
+  Serial.println("[EI] Model: " + String(EI_CLASSIFIER_PROJECT_NAME));
+  Serial.println("[EI] Labels: " + String(EI_CLASSIFIER_LABEL_COUNT) + ", Window: " + String(EI_CLASSIFIER_RAW_SAMPLE_COUNT) + " samples @ " + String(EI_CLASSIFIER_FREQUENCY) + "Hz");
   Serial.println();
   Serial.println("All sensors initialized. Entering main loop.");
   Serial.println("-------------------------------------------------");
@@ -293,7 +333,53 @@ void loop() {
     yaw = heading;
 
     // ---------------------------------------------------------
-    // 6. Serial output for debugging (offset-corrected values)
+    // 6. Edge Impulse: sample into inference buffer at ~60 Hz
+    // ---------------------------------------------------------
+    if (now - prevEISampleTime >= EI_SAMPLE_INTERVAL_MS) {
+      prevEISampleTime = now;
+
+      // Push 6 axis values into the buffer
+      ei_buffer[ei_buffer_ix + 0] = accelX;
+      ei_buffer[ei_buffer_ix + 1] = accelY;
+      ei_buffer[ei_buffer_ix + 2] = accelZ;
+      ei_buffer[ei_buffer_ix + 3] = gyroX;
+      ei_buffer[ei_buffer_ix + 4] = gyroY;
+      ei_buffer[ei_buffer_ix + 5] = gyroZ;
+      ei_buffer_ix += EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME; // += 6
+
+      // Buffer is full — run inference
+      if (ei_buffer_ix >= EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE) {
+        ei_buffer_ix = 0;
+
+        signal_t signal;
+        signal.total_length = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE;
+        signal.get_data = &raw_feature_get_data;
+
+        ei_impulse_result_t result = { 0 };
+        EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
+
+        if (err == EI_IMPULSE_OK) {
+          // Find the label with highest confidence
+          float maxVal = 0.0f;
+          int   maxIdx = -1;
+          for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+            if (result.classification[i].value > maxVal) {
+              maxVal = result.classification[i].value;
+              maxIdx = i;
+            }
+          }
+          gestureConfidence = maxVal;
+          if (maxVal >= CONFIDENCE_THRESHOLD && maxIdx >= 0) {
+            gestureLabel = String(result.classification[maxIdx].label);
+          } else {
+            gestureLabel = "idle";
+          }
+        }
+      }
+    }
+
+    // ---------------------------------------------------------
+    // 7. Serial output for debugging (offset-corrected values)
     // ---------------------------------------------------------
     float displayRoll  = roll  - rollOffset;
     float displayPitch = pitch - pitchOffset;
@@ -310,7 +396,11 @@ void loop() {
     Serial.print(pitchStr);
     Serial.print("° | Yaw: ");
     Serial.print(yawStr);
-    Serial.println("°");
+    Serial.print("° | Gesture: ");
+    Serial.print(gestureLabel);
+    Serial.print(" (");
+    Serial.print(gestureConfidence, 2);
+    Serial.println(")");
   }
 
   // ===========================================================
@@ -426,7 +516,13 @@ void loop() {
       display.print((char)247);
 
       // Bottom separator
-      display.drawLine(0, 56, 127, 56, SSD1306_WHITE);
+      display.drawLine(0, 54, 127, 54, SSD1306_WHITE);
+
+      // --- Gesture Label ---
+      String upperGesture = gestureLabel;
+      upperGesture.toUpperCase();
+      display.setCursor(0, 56);
+      display.print(upperGesture);
     }
 
     // Push to display
