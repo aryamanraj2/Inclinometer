@@ -124,14 +124,26 @@ int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
 }
 
 // ============================================================
-// Helper: Format angle string with explicit sign and 2 decimals
-// Writes into the provided buffer (must be at least 10 chars)
+// Helper: Format angle string with explicit sign and 1 decimal
+// Compact format for large-text OLED display
 // ============================================================
 void formatAngle(char* buf, float angle) {
   char sign = (angle >= 0.0f) ? '+' : '-';
   float absAngle = fabs(angle);
-  // Format: +123.45 or -005.67
-  sprintf(buf, "%c%06.2f", sign, absAngle);
+  if (absAngle > 999.9f) absAngle = 999.9f;  // Clamp overflow
+  sprintf(buf, "%c%05.1f", sign, absAngle);
+}
+
+// ============================================================
+// Helper: Draw a rounded-corner rectangle (1px border radius)
+// ============================================================
+void drawRoundBox(int16_t x, int16_t y, int16_t w, int16_t h) {
+  // Horizontal lines (inset 1px from corners)
+  display.drawFastHLine(x + 1, y, w - 2, SSD1306_WHITE);
+  display.drawFastHLine(x + 1, y + h - 1, w - 2, SSD1306_WHITE);
+  // Vertical lines (inset 1px from corners)
+  display.drawFastVLine(x, y + 1, h - 2, SSD1306_WHITE);
+  display.drawFastVLine(x + w - 1, y + 1, h - 2, SSD1306_WHITE);
 }
 
 // ============================================================
@@ -219,13 +231,27 @@ void setup() {
   // Show a brief splash screen
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
+
+  // Outer border
+  drawRoundBox(2, 2, 124, 60);
+
+  // Title
+  display.setTextSize(2);
+  display.setCursor(16, 8);
+  display.print("INCLINE");
+
+  // Thin separator
+  display.drawFastHLine(10, 27, 108, SSD1306_WHITE);
+
+  // Subtitle
   display.setTextSize(1);
-  display.setCursor(20, 10);
-  display.println("ORIENTATION");
-  display.setCursor(30, 25);
-  display.println("SYSTEM");
-  display.setCursor(25, 45);
-  display.println("Starting...");
+  display.setCursor(16, 33);
+  display.print("Orientation System");
+
+  // Version / loading indicator
+  display.setCursor(34, 50);
+  display.print("Loading...");
+
   display.display();
   delay(1000);  // Only delay in setup — splash screen
 
@@ -458,71 +484,101 @@ void loop() {
     display.clearDisplay();
 
     if (showZeroMsg) {
-      // --- "ZERO SET!" Feedback Screen ---
+      // ═══════════════════════════════════════════════════════
+      // "ZERO SET!" Feedback — checkmark + bordered layout
+      // ═══════════════════════════════════════════════════════
+      drawRoundBox(4, 2, 120, 60);
+
+      // Large checkmark icon (drawn with lines)
+      display.drawLine(40, 30, 52, 42, SSD1306_WHITE);  // short leg
+      display.drawLine(52, 42, 76, 18, SSD1306_WHITE);  // long leg
+      display.drawLine(40, 31, 52, 43, SSD1306_WHITE);  // thicken
+      display.drawLine(52, 43, 76, 19, SSD1306_WHITE);  // thicken
+
+      // "ZERO SET" text below checkmark
       display.setTextSize(1);
       display.setTextColor(SSD1306_WHITE);
-      display.setCursor(10, 8);
-      display.println("==================");
-      display.setCursor(16, 20);
-      display.println("ZERO SET!");
-      display.setCursor(16, 32);
-      display.println("New reference");
-      display.setCursor(16, 44);
-      display.println("saved");
-      display.setCursor(10, 54);
-      display.println("==================");
+      display.setCursor(32, 50);
+      display.print("ZERO  SET!");
+
     } else {
-      // --- Normal Orientation Display ---
+      // ═══════════════════════════════════════════════════════
+      // Normal Orientation Display — clean, readable layout
+      // ═══════════════════════════════════════════════════════
       float displayRoll  = roll  - rollOffset;
       float displayPitch = pitch - pitchOffset;
       float displayYaw   = yaw   - yawOffset;
 
-      // --- Header ---
-      display.setTextSize(1);
-      display.setTextColor(SSD1306_WHITE);
-      display.setCursor(22, 0);
-      display.println("ORIENTATION");
-
-      // Separator line
-      display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
-
-      // --- Angle Values ---
       char angleBuf[12];
 
-      // Roll
+      // --- Top bar: inverted "INCLINOMETER" header ---
+      display.fillRect(0, 0, 128, 11, SSD1306_WHITE);
       display.setTextSize(1);
-      display.setCursor(0, 16);
-      display.print("Roll  : ");
+      display.setTextColor(SSD1306_BLACK);
+      display.setCursor(22, 2);
+      display.print("INCLINOMETER");
+      display.setTextColor(SSD1306_WHITE);  // Reset for below
+
+      // --- Row 1: Roll — label small, value large ---
+      // Y = 13
+      display.setTextSize(1);
+      display.setCursor(0, 15);
+      display.print("R");
+
+      display.setTextSize(2);
+      display.setCursor(10, 13);
       formatAngle(angleBuf, displayRoll);
+      display.print(angleBuf);
+      // Degree symbol at text size 1 after the large number
       display.setTextSize(1);
-      display.setCursor(50, 16);
-      display.print(angleBuf);
-      display.print((char)247);  // degree symbol
+      display.setCursor(82, 13);
+      display.print((char)247);
 
-      // Pitch
-      display.setCursor(0, 30);
-      display.print("Pitch : ");
+      // --- Row 2: Pitch ---
+      // Y = 31
+      display.setTextSize(1);
+      display.setCursor(0, 33);
+      display.print("P");
+
+      display.setTextSize(2);
+      display.setCursor(10, 31);
       formatAngle(angleBuf, displayPitch);
-      display.setCursor(50, 30);
       display.print(angleBuf);
+      display.setTextSize(1);
+      display.setCursor(82, 31);
       display.print((char)247);
 
-      // Yaw
-      display.setCursor(0, 44);
-      display.print("Yaw   : ");
+      // --- Thin separator ---
+      display.drawFastHLine(0, 48, 128, SSD1306_WHITE);
+
+      // --- Row 3: Yaw (compass heading) — bottom section ---
+      // Y = 50
+      display.setTextSize(1);
+      display.setCursor(0, 52);
+      display.print("Y");
+
+      display.setCursor(10, 52);
       formatAngle(angleBuf, displayYaw);
-      display.setCursor(50, 44);
       display.print(angleBuf);
       display.print((char)247);
 
-      // Bottom separator
-      display.drawLine(0, 54, 127, 54, SSD1306_WHITE);
-
-      // --- Gesture Label ---
+      // --- Gesture label — right side of bottom row ---
       String upperGesture = gestureLabel;
       upperGesture.toUpperCase();
-      display.setCursor(0, 56);
+
+      // Small vertical separator between yaw and gesture
+      display.drawFastVLine(68, 50, 14, SSD1306_WHITE);
+
+      // Filled accent box for gesture
+      display.fillRect(70, 50, 58, 14, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+      // Center gesture text within box
+      int gestLen = upperGesture.length();
+      int gestX = 70 + (58 - gestLen * 6) / 2;
+      if (gestX < 72) gestX = 72;
+      display.setCursor(gestX, 53);
       display.print(upperGesture);
+      display.setTextColor(SSD1306_WHITE);  // Restore
     }
 
     // Push to display
