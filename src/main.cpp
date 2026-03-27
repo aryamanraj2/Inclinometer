@@ -31,10 +31,18 @@
 #define OLED_UPDATE_INTERVAL_MS 100     // OLED refresh interval (100ms = 10 Hz)
 #define SENSOR_INTERVAL_MS      10      // Sensor read interval (10ms = 100 Hz)
 #define BUTTON_PIN              15      // GPIO15 — zero calibration button (active LOW)
+#define MODE_BUTTON_PIN         19      // GPIO19 — display mode cycling button (active LOW)
 #define DEBOUNCE_MS             50      // Button debounce time (ms)
+#define MODE_DEBOUNCE_MS        50      // Mode button debounce time (ms)
 #define ZERO_MSG_DURATION_MS    1000    // "ZERO SET!" OLED message display time (ms)
 #define CONFIDENCE_THRESHOLD    0.7f    // Minimum confidence to accept a gesture
 #define EI_SAMPLE_INTERVAL_MS   16      // ~60 Hz sampling for Edge Impulse (matches model training)
+#define TOTAL_MODES             4       // Number of display modes (Normal, Z, X, Y)
+#define OUTER_RING_RADIUS       27      // Bubble level outer circle radius (px)
+#define BUBBLE_RADIUS           4       // Bubble dot radius (px)
+#define BUBBLE_CENTER_X         64      // Circle center X on 128-wide screen
+#define BUBBLE_CENTER_Y         32      // Circle center Y (perfect vertical center)
+#define MAX_TILT_ANGLE          45.0f   // Angle (°) at which bubble reaches outer ring edge
 
 // ============================================================
 // OLED Configuration
@@ -94,6 +102,14 @@ bool  showZeroMsg          = false;  // Whether to show "ZERO SET!" on OLED
 unsigned long zeroMsgStartTime = 0;  // When the message was triggered
 
 // ============================================================
+// Mode Button State
+// ============================================================
+int   currentMode              = 0;     // 0=Normal, 1=Z-level, 2=X-level, 3=Y-level
+int   lastModeButtonState      = HIGH;  // Previous raw reading
+int   acceptedModeButtonState  = HIGH;  // Debounced stable state
+unsigned long lastModeDebounceTime = 0; // Timestamp of last mode button state change
+
+// ============================================================
 // Edge Impulse Gesture Inference State
 // ============================================================
 float ei_buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE]; // Buffer: 120 samples × 6 axes = 720 floats
@@ -124,14 +140,23 @@ int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
 }
 
 // ============================================================
-// Helper: Format angle string with explicit sign and 1 decimal
-// Compact format for large-text OLED display
+// Helper: Format angle string natively +123.4
 // ============================================================
 void formatAngle(char* buf, float angle) {
   char sign = (angle >= 0.0f) ? '+' : '-';
   float absAngle = fabs(angle);
   if (absAngle > 999.9f) absAngle = 999.9f;  // Clamp overflow
   sprintf(buf, "%c%05.1f", sign, absAngle);
+}
+
+// ============================================================
+// Helper: Format angle string compactly +12.3
+// ============================================================
+void formatAngleCompact(char* buf, float angle) {
+  char sign = (angle >= 0.0f) ? '+' : '-';
+  float absAngle = fabs(angle);
+  if (absAngle > 99.9f) absAngle = 99.9f;
+  sprintf(buf, "%c%.1f", sign, absAngle);
 }
 
 // ============================================================
@@ -144,6 +169,126 @@ void drawRoundBox(int16_t x, int16_t y, int16_t w, int16_t h) {
   // Vertical lines (inset 1px from corners)
   display.drawFastVLine(x, y + 1, h - 2, SSD1306_WHITE);
   display.drawFastVLine(x + w - 1, y + 1, h - 2, SSD1306_WHITE);
+}
+
+// ============================================================
+// Helper: Draw a polished bubble level on the OLED
+// mode: 1=Z(roll+pitch), 2=X(pitch only), 3=Y(roll only)
+// ============================================================
+void drawBubbleLevel(int mode, float displayRoll, float displayPitch) {
+  const int cx = BUBBLE_CENTER_X;
+  const int cy = BUBBLE_CENTER_Y;
+  const int R  = OUTER_RING_RADIUS;
+  const int r  = BUBBLE_RADIUS;
+  const float maxOffset = (float)(R - r - 2); // max bubble travel from center
+
+  // === Outer ring (double line for thickness) ===
+  display.drawCircle(cx, cy, R, SSD1306_WHITE);
+  display.drawCircle(cx, cy, R - 1, SSD1306_WHITE);
+
+  // === Tick marks at cardinal points (4px long, inside ring) ===
+  display.drawFastVLine(cx, cy - R + 2, 4, SSD1306_WHITE); // Top
+  display.drawFastVLine(cx, cy + R - 5, 4, SSD1306_WHITE); // Bottom
+  display.drawFastHLine(cx - R + 2, cy, 4, SSD1306_WHITE); // Left
+  display.drawFastHLine(cx + R - 5, cy, 4, SSD1306_WHITE); // Right
+
+  // === Center crosshair (7x7 plus sign) ===
+  display.drawFastHLine(cx - 3, cy, 7, SSD1306_WHITE);
+  display.drawFastVLine(cx, cy - 3, 7, SSD1306_WHITE);
+
+  // === Gauge-style Mode Header (cuts into the top of the ring) ===
+  const char* modeLabel;
+  if (mode == 1) modeLabel = "Z-LEVEL";
+  else if (mode == 2) modeLabel = "X-LEVEL";
+  else modeLabel = "Y-LEVEL";
+  
+  int labelLen = strlen(modeLabel);
+  int labelWidth = labelLen * 6;
+  int labelX = cx - (labelWidth / 2);
+  
+  // Cutout background
+  display.fillRect(labelX - 4, 0, labelWidth + 8, 10, SSD1306_BLACK);
+  display.setCursor(labelX, 1);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.print(modeLabel);
+
+  // === Calculate bubble position ===
+  float bx_offset = 0.0f;
+  float by_offset = 0.0f;
+
+  if (mode == 1) {
+    // Z-level: Roll controls X, Pitch controls Y
+    bx_offset = (displayRoll / MAX_TILT_ANGLE) * maxOffset;
+    by_offset = (displayPitch / MAX_TILT_ANGLE) * maxOffset;
+  } else if (mode == 2) {
+    // X-level: Pitch controls horizontal only
+    bx_offset = (displayPitch / MAX_TILT_ANGLE) * maxOffset;
+    by_offset = 0.0f;
+  } else {
+    // Y-level: Roll controls horizontal only
+    bx_offset = (displayRoll / MAX_TILT_ANGLE) * maxOffset;
+    by_offset = 0.0f;
+  }
+
+  // Clamp: bubble must stay within outer ring travel limit
+  float dist = sqrt(bx_offset * bx_offset + by_offset * by_offset);
+  if (dist > maxOffset) {
+    float scale = maxOffset / dist;
+    bx_offset *= scale;
+    by_offset *= scale;
+  }
+
+  int bx = cx + (int)bx_offset;
+  int by = cy + (int)by_offset;
+
+  // === Draw bubble (filled circle with a highlight) ===
+  display.fillCircle(bx, by, r, SSD1306_WHITE);
+  // Tiny "shine" dot for 3D effect
+  display.drawPixel(bx - 1, by - 1, SSD1306_BLACK);
+
+  // === Angle Data Display ===
+  char angleBuf[12];
+  display.setTextSize(1);
+
+  if (mode == 1) {
+    // Z-Level: Place cleanly on the left and right outer sides
+    // Left side: Roll
+    display.setCursor(0, 22);
+    display.print("ROLL");
+    display.setCursor(0, 33);
+    formatAngleCompact(angleBuf, displayRoll);
+    display.print(angleBuf);
+    display.print((char)247); // Degree symbol
+
+    // Right side: Pitch
+    display.setCursor(98, 22);
+    display.print("PITCH");
+    formatAngleCompact(angleBuf, displayPitch);
+    int textX = 127 - (strlen(angleBuf) + 1) * 6; // Right-align
+    display.setCursor(textX, 33);
+    display.print(angleBuf);
+    display.print((char)247);
+  } else {
+    // Modes 2/3: 1-axis. Place actively tracked value in a bottom cutout.
+    String valStr = (mode == 2 ? "PITCH: " : "ROLL: ");
+    formatAngleCompact(angleBuf, mode == 2 ? displayPitch : displayRoll);
+    valStr += angleBuf;
+    
+    int valLen = valStr.length() + 1; // +1 for degree symbol
+    int valWidth = valLen * 6;
+    int valX = cx - (valWidth / 2);
+    
+    // Bottom cutout
+    display.fillRect(valX - 4, 54, valWidth + 8, 10, SSD1306_BLACK);
+    display.setCursor(valX, 55);
+    display.print(valStr);
+    display.print((char)247);
+  }
+
+  // Place Yaw: N/A cleanly out of the way in bottom-left
+  display.setCursor(0, 56);
+  display.print("Y:N/A");
 }
 
 // ============================================================
@@ -261,6 +406,13 @@ void setup() {
   lastButtonState    = digitalRead(BUTTON_PIN);  // Seed with actual pin state
   acceptedButtonState = lastButtonState;          // No spurious trigger on first loop
   Serial.println("[BUTTON] GPIO" + String(BUTTON_PIN) + " configured (INPUT_PULLUP, initial=" + String(lastButtonState) + ")");
+
+  // --- Mode Button ---
+  pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
+  delay(10);
+  lastModeButtonState    = digitalRead(MODE_BUTTON_PIN);
+  acceptedModeButtonState = lastModeButtonState;
+  Serial.println("[MODE]   GPIO" + String(MODE_BUTTON_PIN) + " configured (INPUT_PULLUP, initial=" + String(lastModeButtonState) + ")");
 
   // --- Madgwick Filter ---
   // Begin with the target sensor sample rate (100 Hz)
@@ -469,6 +621,28 @@ void loop() {
 
   lastButtonState = currentReading;
 
+  // ===========================================================
+  // MODE BUTTON DEBOUNCE — non-blocking, cycles display modes
+  // ===========================================================
+  int modeReading = digitalRead(MODE_BUTTON_PIN);
+
+  if (modeReading != lastModeButtonState) {
+    lastModeDebounceTime = now;
+  }
+
+  if ((now - lastModeDebounceTime) >= MODE_DEBOUNCE_MS) {
+    if (modeReading != acceptedModeButtonState) {
+      acceptedModeButtonState = modeReading;
+
+      if (acceptedModeButtonState == LOW) {
+        currentMode = (currentMode + 1) % TOTAL_MODES;
+        Serial.println("[MODE] Switched to mode " + String(currentMode));
+      }
+    }
+  }
+
+  lastModeButtonState = modeReading;
+
   // Auto-clear "ZERO SET!" message after duration expires
   if (showZeroMsg && (now - zeroMsgStartTime >= ZERO_MSG_DURATION_MS)) {
     showZeroMsg = false;
@@ -501,9 +675,9 @@ void loop() {
       display.setCursor(32, 50);
       display.print("ZERO  SET!");
 
-    } else {
+    } else if (currentMode == 0) {
       // ═══════════════════════════════════════════════════════
-      // Normal Orientation Display — clean, readable layout
+      // Mode 0: Normal Orientation Display — clean, readable layout
       // ═══════════════════════════════════════════════════════
       float displayRoll  = roll  - rollOffset;
       float displayPitch = pitch - pitchOffset;
@@ -579,6 +753,14 @@ void loop() {
       display.setCursor(gestX, 53);
       display.print(upperGesture);
       display.setTextColor(SSD1306_WHITE);  // Restore
+
+    } else {
+      // ═══════════════════════════════════════════════════════
+      // Modes 1–3: Bubble Level Display
+      // ═══════════════════════════════════════════════════════
+      float displayRoll  = roll  - rollOffset;
+      float displayPitch = pitch - pitchOffset;
+      drawBubbleLevel(currentMode, displayRoll, displayPitch);
     }
 
     // Push to display
