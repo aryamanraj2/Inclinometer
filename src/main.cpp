@@ -1,7 +1,7 @@
 /*
  * ESP32 Orientation System
  * ========================
- * MPU6050 (Accel + Gyro) + QMC5883L (Magnetometer) + SSD1306 OLED
+ * MPU6050 (Accel + Gyro) + QMC5883P (Magnetometer) + SSD1306 OLED
  *
  * - Roll & Pitch from Madgwick AHRS filter (accel + gyro fusion)
  * - Yaw from tilt-compensated magnetometer (hard-iron corrected)
@@ -12,11 +12,12 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <MPU6050.h>
-#include <QMC5883LCompass.h>
+#include <qmc5883p.h>
 #include <MadgwickAHRS.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Inclinometer_inferencing.h>
+#include <Preferences.h>
 
 // ============================================================
 // TUNABLE PARAMETERS — adjust these as needed
@@ -51,8 +52,19 @@
 #define BUZZER_CHANNEL          0       // LEDC PWM channel for buzzer
 #define BUZZER_FREQ             2000    // Hz — audible beep frequency
 #define BUZZER_RESOLUTION       8       // PWM resolution in bits (0–255)
-#define TILT_THRESHOLD          30.0f   // Degrees — alert if |roll| or |pitch| exceeds this
 #define BUZZER_DUTY             128     // 50% duty cycle (out of 255 for 8-bit)
+
+// ============================================================
+// Settings Menu Buttons & Threshold Configuration
+// ============================================================
+#define BUTTON_LEFT             26      // GPIO26 — decrease value (active LOW)
+#define BUTTON_MIDDLE           27      // GPIO27 — enter/exit menu (active LOW)
+#define BUTTON_RIGHT            25      // GPIO25 — increase value (active LOW)
+#define THRESHOLD_MIN           5.0f    // Minimum tilt threshold (degrees)
+#define THRESHOLD_MAX           90.0f   // Maximum tilt threshold (degrees)
+#define THRESHOLD_DEFAULT       30.0f   // Default tilt threshold (degrees)
+#define HOLD_REPEAT_DELAY_MS    1000    // Delay before hold-repeat starts (ms)
+#define HOLD_REPEAT_RATE_MS     200     // Rate of hold-repeat once started (ms)
 
 // ============================================================
 // OLED Configuration
@@ -71,12 +83,18 @@
 #define RAD_TO_DEG_F  (180.0f / PI)
 
 // ============================================================
+// Magnetometer I2C Address
+// ============================================================
+#define MAG_ADDR_QMC5883P  0x2C  // QMC5883P I2C address
+
+// ============================================================
 // Global Objects
 // ============================================================
 MPU6050 mpu;
-QMC5883LCompass compass;
+QMC5883P mag;
 Madgwick madgwickFilter;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Preferences preferences;
 
 // ============================================================
 // Timing Variables
@@ -118,6 +136,33 @@ int   currentMode              = 0;     // 0=Normal, 1=Z-level, 2=X-level, 3=Y-l
 int   lastModeButtonState      = HIGH;  // Previous raw reading
 int   acceptedModeButtonState  = HIGH;  // Debounced stable state
 unsigned long lastModeDebounceTime = 0; // Timestamp of last mode button state change
+
+// ============================================================
+// Settings Menu State
+// ============================================================
+bool  menuActive               = false;  // Whether settings menu is currently displayed
+float tiltThreshold            = THRESHOLD_DEFAULT;  // Runtime tilt threshold (loaded from NVS)
+
+// Left button (GPIO26) debounce + hold state
+int   lastLeftButtonState      = HIGH;
+int   acceptedLeftButtonState  = HIGH;
+unsigned long lastLeftDebounceTime  = 0;
+bool  leftButtonHeld           = false;
+unsigned long leftHoldStartTime    = 0;
+unsigned long leftLastRepeatTime   = 0;
+
+// Middle button (GPIO27) debounce state
+int   lastMiddleButtonState    = HIGH;
+int   acceptedMiddleButtonState = HIGH;
+unsigned long lastMiddleDebounceTime = 0;
+
+// Right button (GPIO25) debounce + hold state
+int   lastRightButtonState     = HIGH;
+int   acceptedRightButtonState = HIGH;
+unsigned long lastRightDebounceTime = 0;
+bool  rightButtonHeld          = false;
+unsigned long rightHoldStartTime   = 0;
+unsigned long rightLastRepeatTime  = 0;
 
 // ============================================================
 // Edge Impulse Gesture Inference State
@@ -374,24 +419,25 @@ void setup() {
     Serial.println("WARNING: testConnection failed (clone chip?), continuing anyway.");
   }
 
-  // --- QMC5883L Initialization ---
-  Serial.print("[QMC5883L] Initializing... ");
-  compass.init();
-  // Set magnetometer mode, data rate, range, and oversampling
-  compass.setMode(0x01, 0x0C, 0x10, 0x00);  // Continuous, 200Hz ODR, 8G range, 512 OSR
-  delay(100);
-  // Quick verification: read and check if we get non-zero data
-  compass.read();
-  int magTestX = compass.getX();
-  int magTestY = compass.getY();
-  int magTestZ = compass.getZ();
-  Serial.print("Mag raw: X="); Serial.print(magTestX);
-  Serial.print(" Y="); Serial.print(magTestY);
-  Serial.print(" Z="); Serial.println(magTestZ);
-  if (magTestX == 0 && magTestY == 0 && magTestZ == 0) {
-    Serial.println("  WARNING — all zeros (device may be at 0x2C instead of 0x0D)");
+  // --- QMC5883P Magnetometer Initialization ---
+  Serial.print("[MAG] Initializing QMC5883P at 0x2C... ");
+  if (!mag.begin()) {
+    Serial.println("FAILED! Check wiring.");
+    Serial.println("[MAG] Yaw will remain at 0.");
   } else {
-    Serial.println("OK");
+    // Test read to verify sensor is producing data
+    float testXYZ[3];
+    delay(100);  // Let sensor settle after init
+    if (mag.readXYZ(testXYZ)) {
+      Serial.print("OK — Mag (µT): X="); Serial.print(testXYZ[0], 1);
+      Serial.print(" Y="); Serial.print(testXYZ[1], 1);
+      Serial.print(" Z="); Serial.println(testXYZ[2], 1);
+      if (testXYZ[0] == 0.0f && testXYZ[1] == 0.0f && testXYZ[2] == 0.0f) {
+        Serial.println("  WARNING — QMC5883P returning zeros. May need calibration.");
+      }
+    } else {
+      Serial.println("OK (init passed, but first read returned no data — will retry in loop)");
+    }
   }
 
   // --- OLED Initialization ---
@@ -442,6 +488,34 @@ void setup() {
   lastModeButtonState    = digitalRead(MODE_BUTTON_PIN);
   acceptedModeButtonState = lastModeButtonState;
   Serial.println("[MODE]   GPIO" + String(MODE_BUTTON_PIN) + " configured (INPUT_PULLUP, initial=" + String(lastModeButtonState) + ")");
+
+  // --- Settings Menu Buttons ---
+  pinMode(BUTTON_LEFT, INPUT_PULLUP);
+  delay(10);
+  lastLeftButtonState    = digitalRead(BUTTON_LEFT);
+  acceptedLeftButtonState = lastLeftButtonState;
+  Serial.println("[BTN_L]  GPIO" + String(BUTTON_LEFT) + " configured (INPUT_PULLUP, initial=" + String(lastLeftButtonState) + ")");
+
+  pinMode(BUTTON_MIDDLE, INPUT_PULLUP);
+  delay(10);
+  lastMiddleButtonState    = digitalRead(BUTTON_MIDDLE);
+  acceptedMiddleButtonState = lastMiddleButtonState;
+  Serial.println("[BTN_M]  GPIO" + String(BUTTON_MIDDLE) + " configured (INPUT_PULLUP, initial=" + String(lastMiddleButtonState) + ")");
+
+  pinMode(BUTTON_RIGHT, INPUT_PULLUP);
+  delay(10);
+  lastRightButtonState    = digitalRead(BUTTON_RIGHT);
+  acceptedRightButtonState = lastRightButtonState;
+  Serial.println("[BTN_R]  GPIO" + String(BUTTON_RIGHT) + " configured (INPUT_PULLUP, initial=" + String(lastRightButtonState) + ")");
+
+  // --- Load Tilt Threshold from NVS ---
+  preferences.begin("settings", true);  // Read-only
+  tiltThreshold = preferences.getFloat("tilt_thresh", THRESHOLD_DEFAULT);
+  preferences.end();
+  // Clamp to valid range in case NVS has stale data
+  if (tiltThreshold < THRESHOLD_MIN) tiltThreshold = THRESHOLD_MIN;
+  if (tiltThreshold > THRESHOLD_MAX) tiltThreshold = THRESHOLD_MAX;
+  Serial.println("[NVS] Loaded tilt threshold: " + String(tiltThreshold, 1) + String((char)176));
 
   // --- Madgwick Filter ---
   // Begin with the target sensor sample rate (100 Hz)
@@ -508,12 +582,17 @@ void loop() {
     pitch = madgwickFilter.getPitch();
 
     // ---------------------------------------------------------
-    // 3. Read QMC5883L magnetometer
+    // 3. Read QMC5883P magnetometer via library
     // ---------------------------------------------------------
-    compass.read();
-    float magX = (float)compass.getX() - MAG_OFFSET_X;
-    float magY = (float)compass.getY() - MAG_OFFSET_Y;
-    float magZ = (float)compass.getZ() - MAG_OFFSET_Z;
+    float magX = 0.0f, magY = 0.0f, magZ = 0.0f;
+
+    float magXYZ[3];
+    if (mag.readXYZ(magXYZ)) {
+      magX = magXYZ[0] - MAG_OFFSET_X;
+      magY = magXYZ[1] - MAG_OFFSET_Y;
+      magZ = magXYZ[2] - MAG_OFFSET_Z;
+    }
+    // If readXYZ fails, magX/Y/Z stay at 0 — yaw will be stale but won't crash
 
     // ---------------------------------------------------------
     // 4. Tilt-compensate magnetometer using Roll & Pitch
@@ -663,29 +742,139 @@ void loop() {
 
   // ===========================================================
   // MODE BUTTON DEBOUNCE — non-blocking, cycles display modes
+  // (only active when menu is NOT open)
   // ===========================================================
-  int modeReading = digitalRead(MODE_BUTTON_PIN);
+  if (!menuActive) {
+    int modeReading = digitalRead(MODE_BUTTON_PIN);
 
-  if (modeReading != lastModeButtonState) {
-    lastModeDebounceTime = now;
-  }
+    if (modeReading != lastModeButtonState) {
+      lastModeDebounceTime = now;
+    }
 
-  if ((now - lastModeDebounceTime) >= MODE_DEBOUNCE_MS) {
-    if (modeReading != acceptedModeButtonState) {
-      acceptedModeButtonState = modeReading;
+    if ((now - lastModeDebounceTime) >= MODE_DEBOUNCE_MS) {
+      if (modeReading != acceptedModeButtonState) {
+        acceptedModeButtonState = modeReading;
 
-      if (acceptedModeButtonState == LOW) {
-        currentMode = (currentMode + 1) % TOTAL_MODES;
-        Serial.println("[MODE] Switched to mode " + String(currentMode));
+        if (acceptedModeButtonState == LOW) {
+          currentMode = (currentMode + 1) % TOTAL_MODES;
+          Serial.println("[MODE] Switched to mode " + String(currentMode));
+        }
       }
     }
-  }
 
-  lastModeButtonState = modeReading;
+    lastModeButtonState = modeReading;
+  }
 
   // Auto-clear "ZERO SET!" message after duration expires
   if (showZeroMsg && (now - zeroMsgStartTime >= ZERO_MSG_DURATION_MS)) {
     showZeroMsg = false;
+  }
+
+  // ===========================================================
+  // SETTINGS MENU BUTTONS — Middle (enter/exit), Left/Right (adjust)
+  // All debounced independently, fully non-blocking
+  // ===========================================================
+
+  // --- Middle Button (GPIO27): Toggle menu ---
+  {
+    int midReading = digitalRead(BUTTON_MIDDLE);
+    if (midReading != lastMiddleButtonState) {
+      lastMiddleDebounceTime = now;
+    }
+    if ((now - lastMiddleDebounceTime) >= DEBOUNCE_MS) {
+      if (midReading != acceptedMiddleButtonState) {
+        acceptedMiddleButtonState = midReading;
+        if (acceptedMiddleButtonState == LOW) {
+          if (menuActive) {
+            // Save threshold to NVS and exit menu
+            preferences.begin("settings", false);  // Read-write
+            preferences.putFloat("tilt_thresh", tiltThreshold);
+            preferences.end();
+            menuActive = false;
+            // Reset tilt trigger state so buzzer doesn't immediately fire
+            tiltTriggered = false;
+            beepState = BEEP_IDLE;
+            ledcWrite(BUZZER_CHANNEL, 0);
+            Serial.println("[MENU] Saved threshold " + String(tiltThreshold, 1) + String((char)176) + " and exited menu.");
+          } else {
+            // Enter menu
+            menuActive = true;
+            Serial.println("[MENU] Entered settings menu.");
+          }
+        }
+      }
+    }
+    lastMiddleButtonState = midReading;
+  }
+
+  // --- Left Button (GPIO26): Decrease threshold (only in menu) ---
+  if (menuActive) {
+    int leftReading = digitalRead(BUTTON_LEFT);
+    if (leftReading != lastLeftButtonState) {
+      lastLeftDebounceTime = now;
+    }
+    if ((now - lastLeftDebounceTime) >= DEBOUNCE_MS) {
+      if (leftReading != acceptedLeftButtonState) {
+        acceptedLeftButtonState = leftReading;
+        if (acceptedLeftButtonState == LOW) {
+          // Single press: decrease by 1
+          if (tiltThreshold > THRESHOLD_MIN) tiltThreshold -= 1.0f;
+          if (tiltThreshold < THRESHOLD_MIN) tiltThreshold = THRESHOLD_MIN;
+          leftButtonHeld = true;
+          leftHoldStartTime = now;
+          leftLastRepeatTime = now;
+        } else {
+          leftButtonHeld = false;
+        }
+      }
+    }
+    lastLeftButtonState = leftReading;
+
+    // Hold-to-repeat: after HOLD_REPEAT_DELAY_MS, repeat at HOLD_REPEAT_RATE_MS
+    if (leftButtonHeld && acceptedLeftButtonState == LOW) {
+      if (now - leftHoldStartTime >= HOLD_REPEAT_DELAY_MS) {
+        if (now - leftLastRepeatTime >= HOLD_REPEAT_RATE_MS) {
+          leftLastRepeatTime = now;
+          if (tiltThreshold > THRESHOLD_MIN) tiltThreshold -= 1.0f;
+          if (tiltThreshold < THRESHOLD_MIN) tiltThreshold = THRESHOLD_MIN;
+        }
+      }
+    }
+  }
+
+  // --- Right Button (GPIO25): Increase threshold (only in menu) ---
+  if (menuActive) {
+    int rightReading = digitalRead(BUTTON_RIGHT);
+    if (rightReading != lastRightButtonState) {
+      lastRightDebounceTime = now;
+    }
+    if ((now - lastRightDebounceTime) >= DEBOUNCE_MS) {
+      if (rightReading != acceptedRightButtonState) {
+        acceptedRightButtonState = rightReading;
+        if (acceptedRightButtonState == LOW) {
+          // Single press: increase by 1
+          if (tiltThreshold < THRESHOLD_MAX) tiltThreshold += 1.0f;
+          if (tiltThreshold > THRESHOLD_MAX) tiltThreshold = THRESHOLD_MAX;
+          rightButtonHeld = true;
+          rightHoldStartTime = now;
+          rightLastRepeatTime = now;
+        } else {
+          rightButtonHeld = false;
+        }
+      }
+    }
+    lastRightButtonState = rightReading;
+
+    // Hold-to-repeat: after HOLD_REPEAT_DELAY_MS, repeat at HOLD_REPEAT_RATE_MS
+    if (rightButtonHeld && acceptedRightButtonState == LOW) {
+      if (now - rightHoldStartTime >= HOLD_REPEAT_DELAY_MS) {
+        if (now - rightLastRepeatTime >= HOLD_REPEAT_RATE_MS) {
+          rightLastRepeatTime = now;
+          if (tiltThreshold < THRESHOLD_MAX) tiltThreshold += 1.0f;
+          if (tiltThreshold > THRESHOLD_MAX) tiltThreshold = THRESHOLD_MAX;
+        }
+      }
+    }
   }
 
   // ===========================================================
@@ -695,8 +884,8 @@ void loop() {
   {
     float displayRollAlert  = roll  - rollOffset;
     float displayPitchAlert = pitch - pitchOffset;
-    bool overThreshold = (fabs(displayRollAlert) > TILT_THRESHOLD) ||
-                         (fabs(displayPitchAlert) > TILT_THRESHOLD);
+    bool overThreshold = (fabs(displayRollAlert) > tiltThreshold) ||
+                         (fabs(displayPitchAlert) > tiltThreshold);
 
     // --- Threshold crossing detection with hysteresis ---
     if (overThreshold && !tiltTriggered && beepState == BEEP_IDLE) {
@@ -775,7 +964,64 @@ void loop() {
 
     display.clearDisplay();
 
-    if (showZeroMsg) {
+    if (menuActive) {
+      // ═══════════════════════════════════════════════════════
+      // SETTINGS MENU — completely replaces all other display
+      // ═══════════════════════════════════════════════════════
+      // Outer border
+      display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+      display.drawRect(1, 1, 126, 62, SSD1306_WHITE);
+
+      // Header bar
+      display.fillRect(2, 2, 124, 12, SSD1306_WHITE);
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_BLACK);
+      int headerX = (128 - 13 * 6) / 2;  // "SETTINGS MENU" = 13 chars
+      display.setCursor(headerX, 4);
+      display.print("SETTINGS MENU");
+      display.setTextColor(SSD1306_WHITE);
+
+      // Separator line below header
+      display.drawFastHLine(2, 14, 124, SSD1306_WHITE);
+
+      // Label
+      display.setTextSize(1);
+      display.setCursor(16, 18);
+      display.print("Tilt Threshold:");
+
+      // Large threshold value in center
+      char threshBuf[8];
+      sprintf(threshBuf, "%03d", (int)tiltThreshold);
+      display.setTextSize(2);
+      // Center: "[ 030 ]°" → "[ " + 3 digits + " ]" + degree = about 8 chars at size 2 (12px each)
+      int valWidth = 6 * 12;  // 6 chars "[ xxx ]" at textSize 2
+      int valX = (128 - valWidth) / 2 - 4;
+      display.setCursor(valX, 28);
+      display.print("[");
+      display.print(threshBuf);
+      display.print("]");
+      display.setTextSize(1);
+      display.setCursor(valX + valWidth + 2, 28);
+      display.print((char)247);  // Degree symbol
+
+      // Bottom instructions
+      display.setTextSize(1);
+      display.setCursor(6, 47);
+      display.print("< decrease");
+
+      // Right-align "increase >"
+      const char* incStr = "increase >";
+      int incWidth = strlen(incStr) * 6;
+      display.setCursor(128 - incWidth - 6, 47);
+      display.print(incStr);
+
+      // Center: "[MID] Save+Exit"
+      const char* saveStr = "[MID] Save+Exit";
+      int saveWidth = strlen(saveStr) * 6;
+      display.setCursor((128 - saveWidth) / 2, 56);
+      display.print(saveStr);
+
+    } else if (showZeroMsg) {
       // ═══════════════════════════════════════════════════════
       // "ZERO SET!" Feedback — checkmark + bordered layout
       // ═══════════════════════════════════════════════════════
@@ -854,6 +1100,15 @@ void loop() {
       display.print(angleBuf);
       display.print((char)247);
 
+      // --- Threshold indicator — subtle, right side of yaw row ---
+      // Show "THR:30°" small text
+      char thrBuf[12];
+      sprintf(thrBuf, "THR:%d", (int)tiltThreshold);
+      int thrWidth = (strlen(thrBuf) + 1) * 6;  // +1 for degree symbol
+      display.setCursor(128 - thrWidth - 2, 56);
+      display.print(thrBuf);
+      display.print((char)247);
+
       // --- Gesture label — right side of bottom row ---
       String upperGesture = gestureLabel;
       upperGesture.toUpperCase();
@@ -862,13 +1117,13 @@ void loop() {
       display.drawFastVLine(68, 50, 14, SSD1306_WHITE);
 
       // Filled accent box for gesture
-      display.fillRect(70, 50, 58, 14, SSD1306_WHITE);
+      display.fillRect(70, 50, 58, 6, SSD1306_WHITE);
       display.setTextColor(SSD1306_BLACK);
       // Center gesture text within box
       int gestLen = upperGesture.length();
       int gestX = 70 + (58 - gestLen * 6) / 2;
       if (gestX < 72) gestX = 72;
-      display.setCursor(gestX, 53);
+      display.setCursor(gestX, 51);
       display.print(upperGesture);
       display.setTextColor(SSD1306_WHITE);  // Restore
 
